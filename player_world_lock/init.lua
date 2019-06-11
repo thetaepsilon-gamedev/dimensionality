@@ -58,131 +58,32 @@ local is_safe_identifier = function(s)
 	return s:match(safe_regex) ~= nil
 end
 
-
-
-
-
-
--- default lock provider: local directory in world dir.
-local errp = function(path)
-	return "protocol violation in file " .. path .. ": " 
-end
-
--- open an instance name stored in a text file and validate it was written correctly.
-local contents_match_regex = "^([^\n]*)(\n?)(.*)$"
-local open_instance_name_file = function(name_path)
-	-- the standalone non-jit lua interpreter does support a 3rd errno return value,
-	-- however luajit doesn't support this so we have to fall back to string match hacks...
-	local f, msg = io.open(name_path, "rb")
-
-	--print(msg)
-	if msg then
-		if msg:find("No such file or directory") then
-			return false
-		else
-			-- hard I/O error such as permission issue,
-			-- probably configuration or otherwise needs admin attention,
-			-- so stop the presses.
-			error(msg)
-		end
-	end
-
-	-- this is probably an I/O error if this fails,
-	-- there's *definitely* nothing we can do about that.
-	local str = assert(f:read("*a"))
-
-	--print(#str, str)
-	local pre, nl, extra = str:match(contents_match_regex)
-	--print(pre, nl, extra)
-
-	-- should only be one line.
-	-- if this is to the contrary,
-	-- someone has written this file that doesn't understand the protocol.
-	-- in this case, all bets and assumptions are off, so stop the presses.
-	if (#extra > 0) then
-		error(errp(name_path) .. "spurious extra lines.")
-	end
-
-	local name
-	if (#nl > 0) then
-		-- if the newline is present but the name isn't,
-		-- someone is mucking us around again.
-		if (#pre == 0) then
-			error(errp(name_path) .. "empty line.")
-		else
-			-- otherwise it's fine - we expect the newline here.
-			return pre
-		end
-	else
-		-- if the newline is not present (line empty or not),
-		-- we take it as a non-atomic write being observed,
-		-- and consider it a transient error.
-		return nil, "newline character not present in " .. path .. ", is the file half written?"
-	end
-end
-
---[[
-README - caveats about the local worlddir provider:
-1) this can potentially get quite cluttered indeed with a lot of players.
-2) multiple servers under *different* users or roles from an OS point of view are probably a no-go.
-	this is because files made by one account may not be removable by another on all OSes.
-	you will likely run into hard error crashes in that case.
-]]
-local local_worlddir_provider = function(current_instance_name, log)
-
-	-- ensure the lock directory exists...
-	local dirlist = minetest.get_dir_list(wp, true)
-	local found = false
-
-	local dir = "player_locks"
-	for i, v in ipairs(dirlist) do
-		if v == dir then
-			found = true
-			break
-		end
-	end
-
-	if not found then
-		error(
-			mne .. "directory " .. dir ..
-			" doesn't exist inside world directory " .. wp .. ". ")
-	end
-	local basedir = wp .. "/" .. dir .. "/"
-	local path = function(playername)
-		return basedir .. playername .. ".txt"
-	end
-
-	local ILockProvider = {}
-	ILockProvider.check = function(playername)
-		local r, msg = open_instance_name_file(path(playername))
-		if r == false then return false end
-		if not r then
-			log(msg)
-		end
-		return r	
-	end
-	ILockProvider.put = function(playername, owner)
-		local f = assert(io.open(path(playername), "w+b"))
-		f:write(owner)
-		f:write("\n")
-		f:close()
-	end
-
-	return ILockProvider
-end
-
-
-
+-- no providers here - for various reasons,
+-- they need to be in other mods (potentially trusted ones).
 local known_providers = {
-	files = local_worlddir_provider,
 }
 local lpre = "[player_world_lock] "
-local txt = ""
-for k, _ in pairs(known_providers) do
-	txt = txt .. " " .. k
+local n = "player_world_lock_register_backend(): "
+local msg_dup = n .. "duplicate lock provider registration for "
+local msg_name = n .. "argument exception: name was not a string, got "
+local msg_constructor = n .. "argument exception: constructor was not a function, got "
+local desc = function(v)
+	return "(type " .. type(v) .. ") " .. tostring(v)
 end
-minetest.log("info", lpre.."known providers:" .. txt)
+-- /global/ --
+player_world_lock_register_backend = function(name, constructor)
+	if type(name) ~= "string" then
+		error(msg_name .. desc(name))
+	end
+	if known_providers[name] then
+		error(msg_dup .. name)
+	end
+	if type(constructor) ~= "function" then
+		error(msg_constructor  .. desc(constructor))
+	end
 
+	known_providers[name] = constructor
+end
 
 
 
@@ -234,16 +135,28 @@ if (t == "nil") then is_lock_master = false end
 
 
 
--- configuration complete; construct the lock provider.
-local constructor = known_providers[provider_name]
-if not constructor then
-	error("unknown lock_provider value from " .. path .. ": " .. provider_name)
-end
-local wpre = "[player_world_lock][lock_provider:"..provider_name.."] "
-local log = function(msg)
-	minetest.log("warning", wpre .. tostring(msg))
-end
-local ILockProvider = constructor(current_instance_name, log)
+
+
+-- configuration complete.
+-- now, as lock provider mods run *after* this mod for dependency reasons,
+-- we must run this in on_mods_loaded.
+local ILockProvider
+minetest.register_on_mods_loaded(function()
+	local constructor = known_providers[provider_name]
+	if not constructor then
+		error("unknown lock_provider value from " .. path .. ": " .. provider_name)
+	end
+
+	local wpre = "[player_world_lock][lock_provider:"..provider_name.."] "
+	local log = function(msg)
+		minetest.log("warning", wpre .. tostring(msg))
+	end
+	ILockProvider = constructor(current_instance_name, log)
+	minetest.log("action", "[player_world_lock] provider configured: " .. provider_name)
+end)
+
+
+
 
 -- TODO: load friendly names file?
 local friendly_names = nil
@@ -331,7 +244,7 @@ local transfer_and_kick_player_inner = function(player_handle, new_owner)
 		"Please connect to: " .. desc)
 end
 
--- /global/
+-- /global/ --
 player_world_lock_transfer_and_kick = function(player_handle, new_owner)
 	-- be careful here - this has to be a *real* player,
 	-- not something merely posing as one.
